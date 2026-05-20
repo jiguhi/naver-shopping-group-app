@@ -314,7 +314,7 @@ def get_existing_ads(api_key, secret_key, customer_id, adgroup_id):
     return existing_refs
 
 
-def create_shopping_product_ad(api_key, secret_key, customer_id, adgroup_id, shopping_product_no, product_bid_amt):
+def create_shopping_product_ad(api_key, secret_key, customer_id, adgroup_id, shopping_product_no, group_bid_amt):
     uri = "/ncc/ads?isList=true"
 
     # 네이버 쇼핑상품 소재 등록 구조
@@ -325,8 +325,8 @@ def create_shopping_product_ad(api_key, secret_key, customer_id, adgroup_id, sho
             "referenceKey": str(shopping_product_no),
             "ad": {},
             "adAttr": {
-                "bidAmt": int(product_bid_amt),
-                "useGroupBidAmt": False
+                "bidAmt": int(group_bid_amt),
+                "useGroupBidAmt": True
             },
             "userLock": False
         }
@@ -336,7 +336,7 @@ def create_shopping_product_ad(api_key, secret_key, customer_id, adgroup_id, sho
     return res
 
 
-def register_products_to_adgroups(api_key, secret_key, customer_id, grouped, group_map, product_bid_amt, log_box):
+def register_products_to_adgroups(api_key, secret_key, customer_id, grouped, group_map, group_bid_amt, log_box):
     result_rows = []
     success_count = 0
     fail_count = 0
@@ -410,7 +410,7 @@ def register_products_to_adgroups(api_key, secret_key, customer_id, grouped, gro
                 customer_id=customer_id,
                 adgroup_id=adgroup_id,
                 shopping_product_no=shopping_no,
-                product_bid_amt=product_bid_amt
+                group_bid_amt=group_bid_amt
             )
 
             if res.ok:
@@ -478,7 +478,7 @@ with st.sidebar:
     st.header("2. 입찰가 설정")
     group_bid_amt = st.number_input("광고그룹 기본 입찰가", min_value=70, value=200, step=10)
     contents_bid_amt = st.number_input("콘텐츠 네트워크 입찰가", min_value=70, value=200, step=10)
-    product_bid_amt = st.number_input("상품 소재 입찰가", min_value=70, value=200, step=10)
+    
 
     st.header("3. 실행 옵션")
     run_create_groups = st.checkbox("카테고리별 광고그룹 생성", value=True)
@@ -588,7 +588,7 @@ if run_btn:
                     customer_id=customer_id,
                     grouped=grouped,
                     group_map=group_map,
-                    product_bid_amt=product_bid_amt,
+                    group_bid_amt=group_bid_amt,
                     log_box=logger
                 )
 
