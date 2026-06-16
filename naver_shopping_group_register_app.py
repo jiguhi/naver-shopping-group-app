@@ -9,9 +9,122 @@ import base64
 import re
 from collections import defaultdict
 from datetime import datetime
-
+import json
+import os
 BASE_URL = "https://api.searchad.naver.com"
+st.write("VERSION 2026-06-16-02")
+SETTING_FILE = "settings.json"
+MAX_ADS_PER_GROUP = 1000
 
+def get_existing_ads_with_count(api_key, secret_key, customer_id, adgroup_id):
+    uri = "/ncc/ads"
+    params = {"nccAdgroupId": adgroup_id}
+
+    res = api_request(api_key, secret_key, customer_id, "GET", uri, params=params)
+
+    if not res.ok:
+        return set(), 0
+
+    existing_refs = set()
+    ads = res.json()
+
+    for ad in ads:
+        ref = str(ad.get("referenceKey", "")).strip()
+        if ref:
+            existing_refs.add(ref)
+
+    return existing_refs, len(ads)
+
+def make_next_group_name(base_group_name, group_map):
+    idx = 1
+
+    while True:
+        new_name = f"{base_group_name} {idx}"
+
+        if new_name not in group_map:
+            return new_name
+
+        idx += 1
+
+
+
+def find_available_group(
+    api_key,
+    secret_key,
+    customer_id,
+    base_group_name,
+    group_map
+):
+    candidate_names = [base_group_name]
+
+    idx = 1
+    while True:
+        name = f"{base_group_name} {idx}"
+
+        if name in group_map:
+            candidate_names.append(name)
+            idx += 1
+        else:
+            break
+
+    last_existing_name = candidate_names[-1]
+    last_group_info = group_map.get(last_existing_name)
+    last_adgroup_id = last_group_info.get("nccAdgroupId")
+
+    existing_refs, ad_count = get_existing_ads_with_count(
+        api_key,
+        secret_key,
+        customer_id,
+        last_adgroup_id
+    )
+
+    if ad_count < MAX_ADS_PER_GROUP:
+        return {
+            "group_name": last_existing_name,
+            "adgroup_id": last_adgroup_id,
+            "existing_refs": existing_refs,
+            "ad_count": ad_count,
+            "need_create": False,
+            "new_group_name": None
+        }
+
+    new_group_name = make_next_group_name(base_group_name, group_map)
+
+    return {
+        "group_name": new_group_name,
+        "adgroup_id": None,
+        "existing_refs": set(),
+        "ad_count": 0,
+        "need_create": True,
+        "new_group_name": new_group_name
+    }
+
+def load_settings():
+    if os.path.exists(SETTING_FILE):
+        try:
+            with open(SETTING_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+
+    return {
+        "api_key": "",
+        "secret_key": "",
+        "customer_id": "",
+        "campaign_id": ""
+    }
+
+
+def save_settings(api_key, secret_key, customer_id, campaign_id):
+    data = {
+        "api_key": api_key,
+        "secret_key": secret_key,
+        "customer_id": customer_id,
+        "campaign_id": campaign_id
+    }
+
+    with open(SETTING_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
 # =========================
 # 인증 / API 요청
@@ -42,21 +155,33 @@ def get_header(api_key, secret_key, customer_id, method, uri):
 
 def api_request(api_key, secret_key, customer_id, method, uri, params=None, json_data=None):
     url = BASE_URL + uri
-
-    # 네이버 검색광고 서명에는 ?isList=true 같은 쿼리스트링 제외
     sign_uri = uri.split("?")[0]
-    headers = get_header(api_key, secret_key, customer_id, method, sign_uri)
 
-    res = requests.request(
-        method=method,
-        url=url,
-        headers=headers,
-        params=params,
-        json=json_data,
-        timeout=30
-    )
-    return res
+    wait_list = [10, 20, 40, 60, 90, 120]
 
+    last_res = None
+
+    for retry, wait in enumerate(wait_list, start=1):
+        headers = get_header(api_key, secret_key, customer_id, method, sign_uri)
+
+        res = requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            params=params,
+            json=json_data,
+            timeout=30
+        )
+
+        last_res = res
+
+        if res.status_code == 400 and "1014" in res.text:
+            time.sleep(wait)
+            continue
+
+        return res
+
+    return last_res
 
 # =========================
 # 상품 / 카테고리 처리
@@ -290,7 +415,7 @@ def create_missing_adgroups(api_key, secret_key, customer_id, campaign_id, group
             })
 
         progress.progress(idx / total)
-        time.sleep(0.25)
+        time.sleep(1)
 
     return group_map, created_rows
 
@@ -335,8 +460,17 @@ def create_shopping_product_ad(api_key, secret_key, customer_id, adgroup_id, sho
     res = api_request(api_key, secret_key, customer_id, "POST", uri, json_data=payload)
     return res
 
-
-def register_products_to_adgroups(api_key, secret_key, customer_id, grouped, group_map, group_bid_amt, log_box):
+def register_products_to_adgroups(
+    api_key,
+    secret_key,
+    customer_id,
+    campaign_id,
+    grouped,
+    group_map,
+    group_bid_amt,
+    contents_bid_amt,
+    log_box
+):
     result_rows = []
     success_count = 0
     fail_count = 0
@@ -346,29 +480,108 @@ def register_products_to_adgroups(api_key, secret_key, customer_id, grouped, gro
     current = 0
     progress = st.progress(0)
 
-    for category_name, products in grouped.items():
-        group_name = clean_group_name(category_name)
-        group_info = group_map.get(group_name)
-        adgroup_id = group_info.get("nccAdgroupId") if group_info else None
+    channels = get_channel_ids_from_same_campaign(
+        api_key,
+        secret_key,
+        customer_id,
+        campaign_id
+    )
 
-        if not adgroup_id:
-            log_box.write(f"[스킵] 광고그룹 없음: {group_name}")
+    for category_name, products in grouped.items():
+        base_group_name = clean_group_name(category_name)
+
+        group_info = group_map.get(base_group_name)
+
+        if not group_info:
+            log_box.write(f"[스킵] 광고그룹 없음: {base_group_name}")
+
             for product in products:
                 skip_count += 1
                 current += 1
+
                 result_rows.append({
                     "category_name": category_name,
-                    "group_name": group_name,
+                    "group_name": base_group_name,
                     "adgroup_id": "",
                     "shopping_product_no": product["shopping_product_no"],
                     "product_name": product["product_name"],
                     "status": "스킵",
                     "message": "광고그룹 없음"
                 })
+
+                progress.progress(current / all_products_count)
+
             continue
 
-        log_box.write(f"상품 등록 시작: {group_name} / {adgroup_id}")
-        existing_refs = get_existing_ads(api_key, secret_key, customer_id, adgroup_id)
+        available = find_available_group(
+            api_key,
+            secret_key,
+            customer_id,
+            base_group_name,
+            group_map
+        )
+
+        active_group_name = available["group_name"]
+        adgroup_id = available["adgroup_id"]
+        existing_refs = available["existing_refs"]
+        ad_count = available["ad_count"]
+
+        if available["need_create"]:
+            log_box.write(f"[기존 확장그룹도 1000개 도달] 새 광고그룹 생성: {active_group_name}")
+
+            res_group = create_adgroup(
+                api_key=api_key,
+                secret_key=secret_key,
+                customer_id=customer_id,
+                campaign_id=campaign_id,
+                group_name=active_group_name,
+                pc_channel_id=channels["pcChannelId"],
+                mobile_channel_id=channels["mobileChannelId"],
+                group_bid_amt=group_bid_amt,
+                contents_bid_amt=contents_bid_amt
+            )
+
+            if res_group.ok:
+                new_data = res_group.json()
+                adgroup_id = new_data.get("nccAdgroupId")
+
+                group_map[active_group_name] = {
+                    "nccAdgroupId": adgroup_id,
+                    "pcChannelId": channels["pcChannelId"],
+                    "mobileChannelId": channels["mobileChannelId"],
+                    "adgroupType": "SHOPPING"
+                }
+
+                existing_refs = set()
+                ad_count = 0
+
+                log_box.write(f"[새 그룹 생성 완료] {active_group_name} / {adgroup_id}")
+
+            else:
+                log_box.write(
+                    f"[새 그룹 생성 실패] {active_group_name} / "
+                    f"{res_group.status_code} / {res_group.text}"
+                )
+
+                for product in products:
+                    fail_count += 1
+                    current += 1
+
+                    result_rows.append({
+                        "category_name": category_name,
+                        "group_name": active_group_name,
+                        "adgroup_id": "",
+                        "shopping_product_no": product["shopping_product_no"],
+                        "product_name": product["product_name"],
+                        "status": "등록실패",
+                        "message": f"새 광고그룹 생성 실패: {res_group.status_code} / {res_group.text}"
+                    })
+
+                    progress.progress(current / all_products_count)
+
+                continue
+
+        log_box.write(f"상품 등록 시작: {active_group_name} / {adgroup_id} / 현재 소재수 {ad_count}")
 
         for product in products:
             current += 1
@@ -377,32 +590,93 @@ def register_products_to_adgroups(api_key, secret_key, customer_id, grouped, gro
 
             if not shopping_no or shopping_no.lower() == "nan":
                 skip_count += 1
+
                 result_rows.append({
                     "category_name": category_name,
-                    "group_name": group_name,
+                    "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
                     "shopping_product_no": shopping_no,
                     "product_name": product_name,
                     "status": "스킵",
                     "message": "상품번호 없음"
                 })
+
                 progress.progress(current / all_products_count)
                 continue
 
             if shopping_no in existing_refs:
                 skip_count += 1
+
                 log_box.write(f"[중복 스킵] {shopping_no} / {product_name}")
+
                 result_rows.append({
                     "category_name": category_name,
-                    "group_name": group_name,
+                    "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
                     "shopping_product_no": shopping_no,
                     "product_name": product_name,
                     "status": "중복스킵",
                     "message": "이미 등록된 상품"
                 })
+
                 progress.progress(current / all_products_count)
                 continue
+
+            if ad_count >= MAX_ADS_PER_GROUP:
+                active_group_name = make_next_group_name(base_group_name, group_map)
+
+                log_box.write(f"[소재 1000개 도달] 새 광고그룹 생성: {active_group_name}")
+
+                res_group = create_adgroup(
+                    api_key=api_key,
+                    secret_key=secret_key,
+                    customer_id=customer_id,
+                    campaign_id=campaign_id,
+                    group_name=active_group_name,
+                    pc_channel_id=channels["pcChannelId"],
+                    mobile_channel_id=channels["mobileChannelId"],
+                    group_bid_amt=group_bid_amt,
+                    contents_bid_amt=contents_bid_amt
+                )
+
+                if res_group.ok:
+                    new_data = res_group.json()
+                    adgroup_id = new_data.get("nccAdgroupId")
+
+                    group_map[active_group_name] = {
+                        "nccAdgroupId": adgroup_id,
+                        "pcChannelId": channels["pcChannelId"],
+                        "mobileChannelId": channels["mobileChannelId"],
+                        "adgroupType": "SHOPPING"
+                    }
+
+                    existing_refs = set()
+                    ad_count = 0
+
+                    log_box.write(f"[새 그룹 생성 완료] {active_group_name} / {adgroup_id}")
+
+                else:
+                    fail_count += 1
+                    if res.status_code == 400 and "1014" in res.text:
+                        log_box.write("[호출 제한 초과] API 제한이 풀리지 않아 실행을 중단합니다. 잠시 후 다시 실행해주세요.")
+                        st.stop()
+                    log_box.write(
+                        f"[새 그룹 생성 실패] {active_group_name} / "
+                        f"{res_group.status_code} / {res_group.text}"
+                    )
+
+                    result_rows.append({
+                        "category_name": category_name,
+                        "group_name": active_group_name,
+                        "adgroup_id": "",
+                        "shopping_product_no": shopping_no,
+                        "product_name": product_name,
+                        "status": "등록실패",
+                        "message": f"새 광고그룹 생성 실패: {res_group.status_code} / {res_group.text}"
+                    })
+
+                    progress.progress(current / all_products_count)
+                    continue
 
             res = create_shopping_product_ad(
                 api_key=api_key,
@@ -416,22 +690,37 @@ def register_products_to_adgroups(api_key, secret_key, customer_id, grouped, gro
             if res.ok:
                 success_count += 1
                 existing_refs.add(shopping_no)
+                ad_count += 1
+
                 log_box.write(f"[등록 완료] {shopping_no} / {product_name}")
+
                 result_rows.append({
                     "category_name": category_name,
-                    "group_name": group_name,
+                    "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
                     "shopping_product_no": shopping_no,
                     "product_name": product_name,
                     "status": "등록완료",
                     "message": res.text
                 })
+
             else:
                 fail_count += 1
-                log_box.write(f"[등록 실패] {shopping_no} / {product_name} / {res.status_code} / {res.text}")
+            
+                if res.status_code == 400 and "1014" in res.text:
+                    log_box.write(
+                        "[호출 제한 초과] API 제한이 풀리지 않아 작업을 종료합니다."
+                    )
+                    st.stop()
+            
+                log_box.write(
+                    f"[등록 실패] {shopping_no} / {product_name} / "
+                    f"{res.status_code} / {res.text}"
+                )
+
                 result_rows.append({
                     "category_name": category_name,
-                    "group_name": group_name,
+                    "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
                     "shopping_product_no": shopping_no,
                     "product_name": product_name,
@@ -440,7 +729,7 @@ def register_products_to_adgroups(api_key, secret_key, customer_id, grouped, gro
                 })
 
             progress.progress(current / all_products_count)
-            time.sleep(0.25)
+            time.sleep(3)
 
     summary = {
         "success_count": success_count,
@@ -449,8 +738,6 @@ def register_products_to_adgroups(api_key, secret_key, customer_id, grouped, gro
     }
 
     return result_rows, summary
-
-
 # =========================
 # Streamlit UI
 # =========================
@@ -470,10 +757,29 @@ st.warning(
 with st.sidebar:
     st.header("1. API 설정")
 
-    api_key = st.text_input("API Key", type="password")
-    secret_key = st.text_input("Secret Key", type="password")
-    customer_id = st.text_input("Customer ID")
-    campaign_id = st.text_input("Campaign ID")
+    settings = load_settings()
+
+    api_key = st.text_input(
+        "API Key",
+        value=settings.get("api_key", ""),
+        type="password"
+    )
+    
+    secret_key = st.text_input(
+        "Secret Key",
+        value=settings.get("secret_key", ""),
+        type="password"
+    )
+    
+    customer_id = st.text_input(
+        "Customer ID",
+        value=settings.get("customer_id", "")
+    )
+    
+    campaign_id = st.text_input(
+        "Campaign ID",
+        value=settings.get("campaign_id", "")
+    )
 
     st.header("2. 입찰가 설정")
     group_bid_amt = st.number_input("광고그룹 기본 입찰가", min_value=70, value=200, step=10)
@@ -539,6 +845,12 @@ with col_run:
     run_btn = st.button("광고그룹 생성 및 상품 등록 실행", type="primary")
 
 if run_btn:
+    save_settings(
+        api_key,
+        secret_key,
+        customer_id,
+        campaign_id
+        )
     if not uploaded_file:
         st.error("CSV 파일을 업로드해주세요.")
     elif not all([api_key, secret_key, customer_id, campaign_id]):
@@ -586,9 +898,11 @@ if run_btn:
                     api_key=api_key,
                     secret_key=secret_key,
                     customer_id=customer_id,
+                    campaign_id=campaign_id,
                     grouped=grouped,
                     group_map=group_map,
                     group_bid_amt=group_bid_amt,
+                    contents_bid_amt=contents_bid_amt,
                     log_box=logger
                 )
 
