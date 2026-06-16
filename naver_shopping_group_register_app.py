@@ -911,7 +911,53 @@ if run_btn:
                 c1.metric("등록 성공", summary["success_count"])
                 c2.metric("등록 실패", summary["fail_count"])
                 c3.metric("중복/스킵", summary["skip_count"])
+                total_count = (
+                summary["success_count"]
+                + summary["fail_count"]
+                + summary["skip_count"]
+            )
+            
+            success_rate = (
+                summary["success_count"] / total_count * 100
+                if total_count > 0 else 0
+            )
+            
+            st.subheader("작업 결과 리포트")
+            
+            report_df = pd.DataFrame([
+                {
+                    "항목": "전체 처리 상품 수",
+                    "결과": f"{total_count:,}개"
+                },
+                {
+                    "항목": "등록 성공",
+                    "결과": f"{summary['success_count']:,}개"
+                },
+                {
+                    "항목": "등록 실패",
+                    "결과": f"{summary['fail_count']:,}개"
+                },
+                {
+                    "항목": "중복/스킵",
+                    "결과": f"{summary['skip_count']:,}개"
+                },
+                {
+                    "항목": "성공률",
+                    "결과": f"{success_rate:.1f}%"
+                },
+                {
+                    "항목": "작업 완료 시간",
+                    "결과": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+            ])
 
+            st.dataframe(report_df, width="stretch")
+            st.download_button(
+                "작업 결과 리포트 CSV 다운로드",
+                report_df.to_csv(index=False, encoding="utf-8-sig"),
+                file_name="naver_shopping_work_summary.csv",
+                mime="text/csv"
+            )
             if group_result_rows:
                 st.subheader("광고그룹 생성 결과")
                 group_df = pd.DataFrame(group_result_rows)
