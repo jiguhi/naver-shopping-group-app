@@ -625,42 +625,45 @@ def register_products_to_adgroups(
                 continue
             if not shopping_no or shopping_no.lower() == "nan":
                 skip_count += 1
-
+            
                 row = {
                     "category_name": category_name,
                     "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
                     "shopping_product_no": shopping_no,
                     "product_name": product_name,
-                    "status": "등록완료",
-                    "message": res.text,
+                    "status": "스킵",
+                    "message": "상품번호 없음",
                     "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
+            
                 result_rows.append(row)
                 save_progress_row(row)
+            
                 progress.progress(current / all_products_count)
                 continue
 
             if shopping_no in existing_refs:
                 skip_count += 1
-
+            
                 log_box.write(f"[중복 스킵] {shopping_no} / {product_name}")
-
+            
                 row = {
                     "category_name": category_name,
                     "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
                     "shopping_product_no": shopping_no,
                     "product_name": product_name,
-                    "status": "등록완료",
-                    "message": res.text,
+                    "status": "중복스킵",
+                    "message": "이미 등록된 상품",
                     "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
+            
                 result_rows.append(row)
                 save_progress_row(row)
+            
                 progress.progress(current / all_products_count)
                 continue
-
             if ad_count >= MAX_ADS_PER_GROUP:
                 active_group_name = make_next_group_name(base_group_name, group_map)
 
@@ -730,6 +733,8 @@ def register_products_to_adgroups(
                 success_count += 1
                 existing_refs.add(shopping_no)
                 ad_count += 1
+            
+                log_box.write(f"[등록 완료] {shopping_no} / {product_name}")
             
                 row = {
                     "category_name": category_name,
