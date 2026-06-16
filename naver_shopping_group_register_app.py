@@ -778,7 +778,7 @@ def register_products_to_adgroups(
                 save_progress_row(row)
 
             progress.progress(current / all_products_count)
-            time.sleep(3)
+            time.sleep(1)
 
     summary = {
         "success_count": success_count,
