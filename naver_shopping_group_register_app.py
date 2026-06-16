@@ -15,7 +15,29 @@ BASE_URL = "https://api.searchad.naver.com"
 st.write("VERSION 2026-06-16-02")
 SETTING_FILE = "settings.json"
 MAX_ADS_PER_GROUP = 1000
+RESULT_FILE = "progress_result.csv"
 
+
+def load_progress():
+    if os.path.exists(RESULT_FILE):
+        try:
+            return pd.read_csv(RESULT_FILE, dtype=str, encoding="utf-8-sig")
+        except:
+            pass
+    return pd.DataFrame()
+
+def save_progress_row(row):
+    df_row = pd.DataFrame([row])
+    file_exists = os.path.exists(RESULT_FILE)
+
+    df_row.to_csv(
+        RESULT_FILE,
+        mode="a",
+        header=not file_exists,
+        index=False,
+        encoding="utf-8-sig"
+    )
+    
 def get_existing_ads_with_count(api_key, secret_key, customer_id, adgroup_id):
     uri = "/ncc/ads"
     params = {"nccAdgroupId": adgroup_id}
@@ -472,6 +494,15 @@ def register_products_to_adgroups(
     log_box
 ):
     result_rows = []
+    progress_df = load_progress()
+
+    done_refs = set()
+    if not progress_df.empty and "shopping_product_no" in progress_df.columns:
+        done_refs = set(
+            progress_df[
+                progress_df["status"].isin(["등록완료", "중복스킵"])
+            ]["shopping_product_no"].astype(str)
+        )
     success_count = 0
     fail_count = 0
     skip_count = 0
@@ -587,20 +618,26 @@ def register_products_to_adgroups(
             current += 1
             shopping_no = str(product["shopping_product_no"]).strip()
             product_name = product["product_name"]
-
+            if shopping_no in done_refs:
+                skip_count += 1
+                log_box.write(f"[이미 처리됨 스킵] {shopping_no} / {product_name}")
+                progress.progress(current / all_products_count)
+                continue
             if not shopping_no or shopping_no.lower() == "nan":
                 skip_count += 1
 
-                result_rows.append({
+                row = {
                     "category_name": category_name,
                     "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
                     "shopping_product_no": shopping_no,
                     "product_name": product_name,
-                    "status": "스킵",
-                    "message": "상품번호 없음"
-                })
-
+                    "status": "등록완료",
+                    "message": res.text,
+                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                result_rows.append(row)
+                save_progress_row(row)
                 progress.progress(current / all_products_count)
                 continue
 
@@ -609,16 +646,18 @@ def register_products_to_adgroups(
 
                 log_box.write(f"[중복 스킵] {shopping_no} / {product_name}")
 
-                result_rows.append({
+                row = {
                     "category_name": category_name,
                     "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
                     "shopping_product_no": shopping_no,
                     "product_name": product_name,
-                    "status": "중복스킵",
-                    "message": "이미 등록된 상품"
-                })
-
+                    "status": "등록완료",
+                    "message": res.text,
+                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                result_rows.append(row)
+                save_progress_row(row)
                 progress.progress(current / all_products_count)
                 continue
 
@@ -691,19 +730,20 @@ def register_products_to_adgroups(
                 success_count += 1
                 existing_refs.add(shopping_no)
                 ad_count += 1
-
-                log_box.write(f"[등록 완료] {shopping_no} / {product_name}")
-
-                result_rows.append({
+            
+                row = {
                     "category_name": category_name,
                     "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
                     "shopping_product_no": shopping_no,
                     "product_name": product_name,
                     "status": "등록완료",
-                    "message": res.text
-                })
-
+                    "message": res.text,
+                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+            
+                result_rows.append(row)
+                save_progress_row(row)
             else:
                 fail_count += 1
             
@@ -718,15 +758,19 @@ def register_products_to_adgroups(
                     f"{res.status_code} / {res.text}"
                 )
 
-                result_rows.append({
+                row = {
                     "category_name": category_name,
                     "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
                     "shopping_product_no": shopping_no,
                     "product_name": product_name,
                     "status": "등록실패",
-                    "message": f"{res.status_code} / {res.text}"
-                })
+                    "message": f"{res.status_code} / {res.text}",
+                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                
+                result_rows.append(row)
+                save_progress_row(row)
 
             progress.progress(current / all_products_count)
             time.sleep(3)
