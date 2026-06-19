@@ -12,9 +12,10 @@ from datetime import datetime
 import json
 import os
 BASE_URL = "https://api.searchad.naver.com"
-st.write("VERSION 2026-06-19-캠페인중복제외")
+st.write("VERSION 2026-06-19-캠페인중복제외-배치등록")
 SETTING_FILE = "settings.json"
 MAX_ADS_PER_GROUP = 1000
+BATCH_SIZE = 20  # 한 번에 등록할 상품 수. 처음엔 20 권장, 안정적이면 50으로 증가 가능
 RESULT_FILE = "progress_result.csv"
 
 
@@ -540,6 +541,45 @@ def create_shopping_product_ad(api_key, secret_key, customer_id, adgroup_id, sho
     res = api_request(api_key, secret_key, customer_id, "POST", uri, json_data=payload)
     return res
 
+
+
+def create_shopping_product_ads_batch(
+    api_key,
+    secret_key,
+    customer_id,
+    adgroup_id,
+    shopping_product_nos,
+    group_bid_amt
+):
+    """
+    SHOPPING_PRODUCT_AD 소재를 여러 개 한 번에 등록합니다.
+    /ncc/ads?isList=true 의 리스트 payload를 사용합니다.
+    """
+    uri = "/ncc/ads?isList=true"
+
+    payload = []
+
+    for shopping_no in shopping_product_nos:
+        payload.append({
+            "nccAdgroupId": adgroup_id,
+            "type": "SHOPPING_PRODUCT_AD",
+            "referenceKey": str(shopping_no).strip(),
+            "ad": {},
+            "adAttr": {
+                "bidAmt": int(group_bid_amt),
+                "useGroupBidAmt": True
+            },
+            "userLock": False
+        })
+
+    return api_request(
+        api_key=api_key,
+        secret_key=secret_key,
+        customer_id=customer_id,
+        method="POST",
+        uri=uri,
+        json_data=payload
+    )
 def register_products_to_adgroups(
     api_key,
     secret_key,
@@ -549,7 +589,8 @@ def register_products_to_adgroups(
     group_map,
     group_bid_amt,
     contents_bid_amt,
-    log_box
+    log_box,
+    batch_size=20
 ):
     result_rows = []
     progress_df = load_progress()
@@ -559,8 +600,9 @@ def register_products_to_adgroups(
         done_refs = set(
             progress_df[
                 progress_df["status"].isin(["등록완료", "중복스킵", "캠페인내이미등록"])
-            ]["shopping_product_no"].astype(str)
+            ]["shopping_product_no"].astype(str).str.strip()
         )
+
     success_count = 0
     fail_count = 0
     skip_count = 0
@@ -576,6 +618,7 @@ def register_products_to_adgroups(
         campaign_id
     )
 
+    # 캠페인 전체 기준으로 이미 등록된 상품을 먼저 조회합니다.
     campaign_existing_refs = get_existing_refs_by_campaign(
         api_key,
         secret_key,
@@ -583,6 +626,21 @@ def register_products_to_adgroups(
         campaign_id,
         log_box=log_box
     )
+
+    batch_size = int(batch_size) if batch_size else 20
+    batch_size = max(1, batch_size)
+
+    def flush_result_rows():
+        """중간 결과를 파일로 저장하고 메모리 리스트를 비웁니다."""
+        nonlocal result_rows
+        if result_rows:
+            for row in result_rows:
+                save_progress_row(row)
+            result_rows = []
+
+    def add_result(row):
+        result_rows.append(row)
+        save_progress_row(row)
 
     for category_name, products in grouped.items():
         base_group_name = clean_group_name(category_name)
@@ -596,14 +654,15 @@ def register_products_to_adgroups(
                 skip_count += 1
                 current += 1
 
-                result_rows.append({
+                add_result({
                     "category_name": category_name,
                     "group_name": base_group_name,
                     "adgroup_id": "",
                     "shopping_product_no": product["shopping_product_no"],
                     "product_name": product["product_name"],
                     "status": "스킵",
-                    "message": "광고그룹 없음"
+                    "message": "광고그룹 없음",
+                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 })
 
                 progress.progress(current / all_products_count)
@@ -664,35 +723,44 @@ def register_products_to_adgroups(
                     fail_count += 1
                     current += 1
 
-                    result_rows.append({
+                    add_result({
                         "category_name": category_name,
                         "group_name": active_group_name,
                         "adgroup_id": "",
                         "shopping_product_no": product["shopping_product_no"],
                         "product_name": product["product_name"],
                         "status": "등록실패",
-                        "message": f"새 광고그룹 생성 실패: {res_group.status_code} / {res_group.text}"
+                        "message": f"새 광고그룹 생성 실패: {res_group.status_code} / {res_group.text}",
+                        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     })
 
                     progress.progress(current / all_products_count)
 
                 continue
 
-        log_box.write(f"상품 등록 시작: {active_group_name} / {adgroup_id} / 현재 소재수 {ad_count}")
+        log_box.write(
+            f"상품 등록 대상 선별 시작: {active_group_name} / "
+            f"{adgroup_id} / 현재 소재수 {ad_count}"
+        )
 
+        register_targets = []
+
+        # 1) 먼저 등록 대상만 선별합니다.
         for product in products:
             current += 1
             shopping_no = str(product["shopping_product_no"]).strip()
             product_name = product["product_name"]
+
             if shopping_no in done_refs:
                 skip_count += 1
                 log_box.write(f"[이미 처리됨 스킵] {shopping_no} / {product_name}")
                 progress.progress(current / all_products_count)
                 continue
+
             if not shopping_no or shopping_no.lower() == "nan":
                 skip_count += 1
-            
-                row = {
+
+                add_result({
                     "category_name": category_name,
                     "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
@@ -701,11 +769,8 @@ def register_products_to_adgroups(
                     "status": "스킵",
                     "message": "상품번호 없음",
                     "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-            
-                result_rows.append(row)
-                save_progress_row(row)
-            
+                })
+
                 progress.progress(current / all_products_count)
                 continue
 
@@ -716,7 +781,7 @@ def register_products_to_adgroups(
 
                 log_box.write(f"[캠페인 내 이미 등록된 상품 제외] {shopping_no} / {product_name}")
 
-                row = {
+                add_result({
                     "category_name": category_name,
                     "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
@@ -725,15 +790,30 @@ def register_products_to_adgroups(
                     "status": "캠페인내이미등록",
                     "message": "같은 캠페인 내 다른 광고그룹에 이미 등록된 상품이므로 등록하지 않음",
                     "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-
-                result_rows.append(row)
-                save_progress_row(row)
+                })
 
                 progress.progress(current / all_products_count)
                 continue
 
-            if ad_count >= MAX_ADS_PER_GROUP:
+            register_targets.append(product)
+            progress.progress(current / all_products_count)
+
+        if not register_targets:
+            log_box.write(f"[등록 대상 없음] {active_group_name}")
+            continue
+
+        log_box.write(
+            f"[배치 등록 시작] {active_group_name} / 등록 대상 {len(register_targets):,}개 / "
+            f"배치 {batch_size}개 단위"
+        )
+
+        target_idx = 0
+
+        while target_idx < len(register_targets):
+            # 1000개 제한에 맞춰 현재 광고그룹에 들어갈 수 있는 수량만 배치로 등록
+            remaining_capacity = MAX_ADS_PER_GROUP - ad_count
+
+            if remaining_capacity <= 0:
                 active_group_name = make_next_group_name(base_group_name, group_map)
 
                 log_box.write(f"[소재 1000개 도달] 새 광고그룹 생성: {active_group_name}")
@@ -763,93 +843,151 @@ def register_products_to_adgroups(
 
                     existing_refs = set()
                     ad_count = 0
+                    remaining_capacity = MAX_ADS_PER_GROUP
 
                     log_box.write(f"[새 그룹 생성 완료] {active_group_name} / {adgroup_id}")
 
                 else:
                     fail_count += 1
+
                     if res_group.status_code == 400 and "1014" in res_group.text:
                         log_box.write("[호출 제한 초과] API 제한이 풀리지 않아 실행을 중단합니다. 잠시 후 다시 실행해주세요.")
                         st.stop()
+
                     log_box.write(
                         f"[새 그룹 생성 실패] {active_group_name} / "
                         f"{res_group.status_code} / {res_group.text}"
                     )
 
-                    result_rows.append({
-                        "category_name": category_name,
-                        "group_name": active_group_name,
-                        "adgroup_id": "",
-                        "shopping_product_no": shopping_no,
-                        "product_name": product_name,
-                        "status": "등록실패",
-                        "message": f"새 광고그룹 생성 실패: {res_group.status_code} / {res_group.text}"
-                    })
+                    # 새 그룹 생성 실패 시 남은 상품은 모두 실패 처리
+                    for product in register_targets[target_idx:]:
+                        add_result({
+                            "category_name": category_name,
+                            "group_name": active_group_name,
+                            "adgroup_id": "",
+                            "shopping_product_no": product["shopping_product_no"],
+                            "product_name": product["product_name"],
+                            "status": "등록실패",
+                            "message": f"새 광고그룹 생성 실패: {res_group.status_code} / {res_group.text}",
+                            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+                        fail_count += 1
 
-                    progress.progress(current / all_products_count)
-                    continue
+                    break
 
-            res = create_shopping_product_ad(
+            batch_count = min(batch_size, remaining_capacity, len(register_targets) - target_idx)
+            batch = register_targets[target_idx:target_idx + batch_count]
+            batch_nos = [str(p["shopping_product_no"]).strip() for p in batch]
+
+            log_box.write(
+                f"[배치 등록] {active_group_name} / "
+                f"{target_idx + 1}~{target_idx + len(batch)} / {len(register_targets)}개"
+            )
+
+            res = create_shopping_product_ads_batch(
                 api_key=api_key,
                 secret_key=secret_key,
                 customer_id=customer_id,
                 adgroup_id=adgroup_id,
-                shopping_product_no=shopping_no,
+                shopping_product_nos=batch_nos,
                 group_bid_amt=group_bid_amt
             )
 
             if res.ok:
-                success_count += 1
-                existing_refs.add(shopping_no)
-                campaign_existing_refs.add(shopping_no)
-                done_refs.add(shopping_no)
-                ad_count += 1
-            
-                log_box.write(f"[등록 완료] {shopping_no} / {product_name}")
-            
-                row = {
-                    "category_name": category_name,
-                    "group_name": active_group_name,
-                    "adgroup_id": adgroup_id,
-                    "shopping_product_no": shopping_no,
-                    "product_name": product_name,
-                    "status": "등록완료",
-                    "message": res.text,
-                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-            
-                result_rows.append(row)
-                save_progress_row(row)
-            else:
-                fail_count += 1
-            
-                if res.status_code == 400 and "1014" in res.text:
-                    log_box.write(
-                        "[호출 제한 초과] API 제한이 풀리지 않아 작업을 종료합니다."
-                    )
-                    st.stop()
-            
-                log_box.write(
-                    f"[등록 실패] {shopping_no} / {product_name} / "
-                    f"{res.status_code} / {res.text}"
+                for product in batch:
+                    shopping_no = str(product["shopping_product_no"]).strip()
+                    product_name = product["product_name"]
+
+                    success_count += 1
+                    existing_refs.add(shopping_no)
+                    campaign_existing_refs.add(shopping_no)
+                    done_refs.add(shopping_no)
+                    ad_count += 1
+
+                    add_result({
+                        "category_name": category_name,
+                        "group_name": active_group_name,
+                        "adgroup_id": adgroup_id,
+                        "shopping_product_no": shopping_no,
+                        "product_name": product_name,
+                        "status": "등록완료",
+                        "message": "배치등록 성공",
+                        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+
+                target_idx += len(batch)
+                time.sleep(0.1)
+                continue
+
+            # 호출 제한이면 즉시 중단
+            if res.status_code == 400 and "1014" in res.text:
+                log_box.write("[호출 제한 초과] API 제한이 풀리지 않아 작업을 종료합니다.")
+                st.stop()
+
+            # 배치 실패 시: 어떤 상품이 문제인지 찾기 위해 해당 배치만 1개씩 재시도
+            log_box.write(
+                f"[배치 등록 실패 → 개별 재시도] {res.status_code} / {res.text}"
+            )
+
+            for product in batch:
+                shopping_no = str(product["shopping_product_no"]).strip()
+                product_name = product["product_name"]
+
+                single_res = create_shopping_product_ad(
+                    api_key=api_key,
+                    secret_key=secret_key,
+                    customer_id=customer_id,
+                    adgroup_id=adgroup_id,
+                    shopping_product_no=shopping_no,
+                    group_bid_amt=group_bid_amt
                 )
 
-                row = {
-                    "category_name": category_name,
-                    "group_name": active_group_name,
-                    "adgroup_id": adgroup_id,
-                    "shopping_product_no": shopping_no,
-                    "product_name": product_name,
-                    "status": "등록실패",
-                    "message": f"{res.status_code} / {res.text}",
-                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                
-                result_rows.append(row)
-                save_progress_row(row)
+                if single_res.ok:
+                    success_count += 1
+                    existing_refs.add(shopping_no)
+                    campaign_existing_refs.add(shopping_no)
+                    done_refs.add(shopping_no)
+                    ad_count += 1
 
-            progress.progress(current / all_products_count)
-            time.sleep(1)
+                    log_box.write(f"[개별 등록 완료] {shopping_no} / {product_name}")
+
+                    add_result({
+                        "category_name": category_name,
+                        "group_name": active_group_name,
+                        "adgroup_id": adgroup_id,
+                        "shopping_product_no": shopping_no,
+                        "product_name": product_name,
+                        "status": "등록완료",
+                        "message": "배치 실패 후 개별등록 성공",
+                        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+
+                else:
+                    fail_count += 1
+
+                    if single_res.status_code == 400 and "1014" in single_res.text:
+                        log_box.write("[호출 제한 초과] API 제한이 풀리지 않아 작업을 종료합니다.")
+                        st.stop()
+
+                    log_box.write(
+                        f"[개별 등록 실패] {shopping_no} / {product_name} / "
+                        f"{single_res.status_code} / {single_res.text}"
+                    )
+
+                    add_result({
+                        "category_name": category_name,
+                        "group_name": active_group_name,
+                        "adgroup_id": adgroup_id,
+                        "shopping_product_no": shopping_no,
+                        "product_name": product_name,
+                        "status": "등록실패",
+                        "message": f"{single_res.status_code} / {single_res.text}",
+                        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+
+                time.sleep(0.1)
+
+            target_idx += len(batch)
 
     summary = {
         "success_count": success_count,
@@ -858,6 +996,7 @@ def register_products_to_adgroups(
     }
 
     return result_rows, summary
+
 # =========================
 # Streamlit UI
 # =========================
@@ -904,6 +1043,7 @@ with st.sidebar:
     st.header("2. 입찰가 설정")
     group_bid_amt = st.number_input("광고그룹 기본 입찰가", min_value=70, value=200, step=10)
     contents_bid_amt = st.number_input("콘텐츠 네트워크 입찰가", min_value=70, value=200, step=10)
+    batch_size = st.number_input("배치 등록 개수", min_value=1, max_value=100, value=BATCH_SIZE, step=5)
     
 
     st.header("3. 실행 옵션")
@@ -1023,7 +1163,8 @@ if run_btn:
                     group_map=group_map,
                     group_bid_amt=group_bid_amt,
                     contents_bid_amt=contents_bid_amt,
-                    log_box=logger
+                    log_box=logger,
+                    batch_size=batch_size
                 )
 
                 st.success("실행 완료")
