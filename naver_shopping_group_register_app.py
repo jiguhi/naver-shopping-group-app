@@ -12,7 +12,7 @@ from datetime import datetime
 import json
 import os
 BASE_URL = "https://api.searchad.naver.com"
-st.write("VERSION 2026-06-16-02")
+st.write("VERSION 2026-06-19-캠페인중복제외")
 SETTING_FILE = "settings.json"
 MAX_ADS_PER_GROUP = 1000
 RESULT_FILE = "progress_result.csv"
@@ -329,6 +329,64 @@ def get_adgroup_map_by_campaign(api_key, secret_key, customer_id, campaign_id):
     return group_map
 
 
+
+def get_existing_refs_by_campaign(api_key, secret_key, customer_id, campaign_id, log_box=None):
+    """
+    캠페인 안의 모든 광고그룹 소재를 조회해서
+    이미 등록된 referenceKey(상품번호)를 전체 기준으로 수집합니다.
+    이 목록에 있는 상품은 다른 광고그룹에도 추가 등록하지 않습니다.
+    """
+    group_map = get_adgroup_map_by_campaign(
+        api_key,
+        secret_key,
+        customer_id,
+        campaign_id
+    )
+
+    campaign_existing_refs = set()
+    campaign_ad_count = 0
+
+    if log_box:
+        log_box.write("[캠페인 전체 등록 상품 조회 시작]")
+
+    scan_progress = st.progress(0)
+    total_groups = len(group_map)
+
+    for idx, (group_name, group_info) in enumerate(group_map.items(), start=1):
+        adgroup_id = group_info.get("nccAdgroupId")
+
+        refs, ad_count = get_existing_ads_with_count(
+            api_key,
+            secret_key,
+            customer_id,
+            adgroup_id
+        )
+
+        campaign_existing_refs.update(refs)
+        campaign_ad_count += ad_count
+
+        if log_box:
+            log_box.write(
+                f"[기존 소재 조회] {idx}/{total_groups} "
+                f"{group_name} / 소재 {ad_count:,}개 / "
+                f"누적 상품 {len(campaign_existing_refs):,}개"
+            )
+
+        if total_groups > 0:
+            scan_progress.progress(idx / total_groups)
+
+        time.sleep(0.3)
+
+    if log_box:
+        log_box.write(
+            f"[캠페인 전체 기존 등록 상품 조회 완료] "
+            f"총 소재 {campaign_ad_count:,}개 / "
+            f"중복 제외 기준 상품 {len(campaign_existing_refs):,}개"
+        )
+
+    return campaign_existing_refs
+
+
 def get_channel_ids_from_same_campaign(api_key, secret_key, customer_id, campaign_id):
     groups = get_adgroups(api_key, secret_key, customer_id)
 
@@ -500,7 +558,7 @@ def register_products_to_adgroups(
     if not progress_df.empty and "shopping_product_no" in progress_df.columns:
         done_refs = set(
             progress_df[
-                progress_df["status"].isin(["등록완료", "중복스킵"])
+                progress_df["status"].isin(["등록완료", "중복스킵", "캠페인내이미등록"])
             ]["shopping_product_no"].astype(str)
         )
     success_count = 0
@@ -516,6 +574,14 @@ def register_products_to_adgroups(
         secret_key,
         customer_id,
         campaign_id
+    )
+
+    campaign_existing_refs = get_existing_refs_by_campaign(
+        api_key,
+        secret_key,
+        customer_id,
+        campaign_id,
+        log_box=log_box
     )
 
     for category_name, products in grouped.items():
@@ -643,27 +709,30 @@ def register_products_to_adgroups(
                 progress.progress(current / all_products_count)
                 continue
 
-            if shopping_no in existing_refs:
+            # 캠페인 전체 기준으로 이미 등록된 상품이면 등록하지 않음
+            if shopping_no in campaign_existing_refs:
                 skip_count += 1
-            
-                log_box.write(f"[중복 스킵] {shopping_no} / {product_name}")
-            
+                done_refs.add(shopping_no)
+
+                log_box.write(f"[캠페인 내 이미 등록된 상품 제외] {shopping_no} / {product_name}")
+
                 row = {
                     "category_name": category_name,
                     "group_name": active_group_name,
                     "adgroup_id": adgroup_id,
                     "shopping_product_no": shopping_no,
                     "product_name": product_name,
-                    "status": "중복스킵",
-                    "message": "이미 등록된 상품",
+                    "status": "캠페인내이미등록",
+                    "message": "같은 캠페인 내 다른 광고그룹에 이미 등록된 상품이므로 등록하지 않음",
                     "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
-            
+
                 result_rows.append(row)
                 save_progress_row(row)
-            
+
                 progress.progress(current / all_products_count)
                 continue
+
             if ad_count >= MAX_ADS_PER_GROUP:
                 active_group_name = make_next_group_name(base_group_name, group_map)
 
@@ -699,7 +768,7 @@ def register_products_to_adgroups(
 
                 else:
                     fail_count += 1
-                    if res.status_code == 400 and "1014" in res.text:
+                    if res_group.status_code == 400 and "1014" in res_group.text:
                         log_box.write("[호출 제한 초과] API 제한이 풀리지 않아 실행을 중단합니다. 잠시 후 다시 실행해주세요.")
                         st.stop()
                     log_box.write(
@@ -732,6 +801,8 @@ def register_products_to_adgroups(
             if res.ok:
                 success_count += 1
                 existing_refs.add(shopping_no)
+                campaign_existing_refs.add(shopping_no)
+                done_refs.add(shopping_no)
                 ad_count += 1
             
                 log_box.write(f"[등록 완료] {shopping_no} / {product_name}")
