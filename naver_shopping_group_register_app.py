@@ -17,7 +17,7 @@ SETTING_FILE = "settings.json"
 MAX_ADS_PER_GROUP = 1000
 BATCH_SIZE = 20  # 한 번에 등록할 상품 수. 처음엔 20 권장, 안정적이면 50으로 증가 가능
 RESULT_FILE = "progress_result.csv"
-
+MAX_GROUP_NAME_LENGTH = 30
 
 def load_progress():
     if os.path.exists(RESULT_FILE):
@@ -62,7 +62,10 @@ def make_next_group_name(base_group_name, group_map):
     idx = 1
 
     while True:
-        new_name = f"{base_group_name} {idx}"
+        new_name = make_group_name_with_suffix(
+            base_group_name,
+            idx
+        )
 
         if new_name not in group_map:
             return new_name
@@ -81,8 +84,12 @@ def find_available_group(
     candidate_names = [base_group_name]
 
     idx = 1
+
     while True:
-        name = f"{base_group_name} {idx}"
+        name = make_group_name_with_suffix(
+            base_group_name,
+            idx
+        )
 
         if name in group_map:
             candidate_names.append(name)
@@ -239,13 +246,59 @@ def make_category_name(row):
 
 
 def clean_group_name(name):
+    """
+    광고그룹명을 정리하고 최대 30자로 제한합니다.
+    """
     name = str(name)
     name = name.replace(">", "-")
     name = name.replace("/", "-")
     name = re.sub(r"[^가-힣a-zA-Z0-9\s_-]", "", name)
     name = re.sub(r"\s+", " ", name).strip()
     name = re.sub(r"\s*-\s*", "-", name)
-    return name[:120]
+
+    if not name:
+        name = "카테고리없음"
+
+    return name[:MAX_GROUP_NAME_LENGTH]
+
+def make_group_name_with_suffix(base_name, number):
+    """
+    '기본 그룹명 2'처럼 번호를 붙이더라도
+    전체 길이가 30자를 넘지 않도록 처리합니다.
+    """
+    suffix = f" {number}"
+    available_length = MAX_GROUP_NAME_LENGTH - len(suffix)
+
+    return f"{base_name[:available_length]}{suffix}"
+
+
+def build_category_group_name_map(grouped):
+    """
+    카테고리별 광고그룹명을 생성합니다.
+
+    그룹명은 최대 30자로 제한하고,
+    동일한 이름이 만들어지면 2, 3 등의 번호를 붙입니다.
+    """
+    category_group_name_map = {}
+    used_group_names = set()
+
+    for category_name in grouped.keys():
+        base_group_name = clean_group_name(category_name)
+        group_name = base_group_name
+
+        number = 2
+
+        while group_name in used_group_names:
+            group_name = make_group_name_with_suffix(
+                base_group_name,
+                number
+            )
+            number += 1
+
+        category_group_name_map[category_name] = group_name
+        used_group_names.add(group_name)
+
+    return category_group_name_map
 
 
 def load_products_from_df(df):
@@ -430,7 +483,17 @@ def create_adgroup(api_key, secret_key, customer_id, campaign_id, group_name, pc
     return res
 
 
-def create_missing_adgroups(api_key, secret_key, customer_id, campaign_id, grouped, group_bid_amt, contents_bid_amt, log_box):
+def create_missing_adgroups(
+    api_key,
+    secret_key,
+    customer_id,
+    campaign_id,
+    grouped,
+    category_group_name_map,
+    group_bid_amt,
+    contents_bid_amt,
+    log_box
+):
     channels = get_channel_ids_from_same_campaign(api_key, secret_key, customer_id, campaign_id)
 
     log_box.write(f"기준 광고그룹: {channels['base_group_name']}")
@@ -444,7 +507,7 @@ def create_missing_adgroups(api_key, secret_key, customer_id, campaign_id, group
     total = len(grouped)
 
     for idx, category_name in enumerate(grouped.keys(), start=1):
-        group_name = clean_group_name(category_name)
+        group_name = category_group_name_map[category_name]
 
         if group_name in group_map:
             adgroup_id = group_map[group_name]["nccAdgroupId"]
@@ -586,6 +649,7 @@ def register_products_to_adgroups(
     customer_id,
     campaign_id,
     grouped,
+    category_group_name_map,
     group_map,
     group_bid_amt,
     contents_bid_amt,
@@ -643,7 +707,7 @@ def register_products_to_adgroups(
         save_progress_row(row)
 
     for category_name, products in grouped.items():
-        base_group_name = clean_group_name(category_name)
+        base_group_name = category_group_name_map[category_name]
 
         group_info = group_map.get(base_group_name)
 
@@ -1060,6 +1124,7 @@ if uploaded_file:
     df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
     products = load_products_from_df(df)
     grouped = group_products(products)
+    category_group_name_map = build_category_group_name_map(grouped)
 
     col1, col2, col3 = st.columns(3)
     col1.metric("CSV 전체 행", f"{len(df):,}")
@@ -1072,7 +1137,8 @@ if uploaded_file:
     preview_df = pd.DataFrame([
         {
             "카테고리": category,
-            "광고그룹명": clean_group_name(category),
+            "광고그룹명": category_group_name_map[category],
+            "그룹명길이": len(category_group_name_map[category]),
             "상품수": len(items)
         }
         for category, items in grouped.items()
@@ -1140,6 +1206,7 @@ if run_btn:
                     customer_id=customer_id,
                     campaign_id=campaign_id,
                     grouped=grouped,
+                    category_group_name_map=category_group_name_map,
                     group_bid_amt=group_bid_amt,
                     contents_bid_amt=contents_bid_amt,
                     log_box=logger
@@ -1160,6 +1227,7 @@ if run_btn:
                     customer_id=customer_id,
                     campaign_id=campaign_id,
                     grouped=grouped,
+                    category_group_name_map=category_group_name_map,
                     group_map=group_map,
                     group_bid_amt=group_bid_amt,
                     contents_bid_amt=contents_bid_amt,
