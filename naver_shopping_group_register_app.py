@@ -12,7 +12,7 @@ from datetime import datetime
 import json
 import os
 BASE_URL = "https://api.searchad.naver.com"
-st.write("VERSION 2026-08-19-중분류선택ver")
+st.write("VERSION 2026-08-19 카테고리그룹기준 추가")
 SETTING_FILE = "settings.json"
 MAX_ADS_PER_GROUP = 1000
 BATCH_SIZE = 20  # 한 번에 등록할 상품 수. 처음엔 20 권장, 안정적이면 50으로 증가 가능
@@ -228,13 +228,17 @@ def get_col(row, keyword):
     return ""
 
 
-def make_category_name(row):
-    cats = [
-        row.get("대분류", ""),
-        row.get("중분류", ""),
-        row.get("소분류", ""),
-        row.get("세분류", "")
-    ]
+# 카테고리 그룹 기준 레벨 (선택 UI 옵션)
+CATEGORY_LEVEL_KEYS = {
+    "소분류": ["대분류", "중분류", "소분류", "세분류"],
+    "중분류": ["대분류", "중분류"],
+}
+
+
+def make_category_name(row, category_level="소분류"):
+    keys = CATEGORY_LEVEL_KEYS.get(category_level, CATEGORY_LEVEL_KEYS["소분류"])
+
+    cats = [row.get(k, "") for k in keys]
 
     cats = [
         str(c).strip()
@@ -301,7 +305,7 @@ def build_category_group_name_map(grouped):
     return category_group_name_map
 
 
-def load_products_from_df(df):
+def load_products_from_df(df, category_level="소분류"):
     # 판매/전시 상태 필터
     if "판매상태" in df.columns:
         df = df[df["판매상태"].astype(str).str.contains("판매", na=False)]
@@ -327,7 +331,7 @@ def load_products_from_df(df):
         ).strip()
 
         product_name = str(row.get("상품명", "")).strip()
-        category_name = make_category_name(row)
+        category_name = make_category_name(row, category_level)
 
         if not shopping_product_no or shopping_product_no.lower() == "nan":
             continue
@@ -1104,13 +1108,22 @@ with st.sidebar:
         value=settings.get("campaign_id", "")
     )
 
-    st.header("2. 입찰가 설정")
+    st.header("2. 카테고리 그룹 기준")
+    category_level = st.radio(
+        "광고그룹을 어떤 카테고리 기준으로 만들지 선택하세요.",
+        options=["소분류", "중분류"],
+        index=0,
+        horizontal=True,
+        help="소분류: 대분류>중분류>소분류>세분류 기준 (기존 방식) / 중분류: 대분류>중분류 기준"
+    )
+
+    st.header("3. 입찰가 설정")
     group_bid_amt = st.number_input("광고그룹 기본 입찰가", min_value=70, value=200, step=10)
     contents_bid_amt = st.number_input("콘텐츠 네트워크 입찰가", min_value=70, value=200, step=10)
     batch_size = st.number_input("배치 등록 개수", min_value=1, max_value=100, value=BATCH_SIZE, step=5)
-    
 
-    st.header("3. 실행 옵션")
+
+    st.header("4. 실행 옵션")
     run_create_groups = st.checkbox("카테고리별 광고그룹 생성", value=True)
     run_register_products = st.checkbox("각 광고그룹에 상품 등록", value=True)
 
@@ -1122,9 +1135,11 @@ grouped = {}
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
-    products = load_products_from_df(df)
+    products = load_products_from_df(df, category_level)
     grouped = group_products(products)
     category_group_name_map = build_category_group_name_map(grouped)
+
+    st.info(f"현재 선택된 카테고리 그룹 기준: **{category_level}**")
 
     col1, col2, col3 = st.columns(3)
     col1.metric("CSV 전체 행", f"{len(df):,}")
@@ -1144,7 +1159,7 @@ if uploaded_file:
         for category, items in grouped.items()
     ])
 
-    st.subheader("카테고리별 광고그룹 미리보기")
+    st.subheader(f"카테고리({category_level})별 광고그룹 미리보기")
     st.dataframe(preview_df, use_container_width=True)
 
     with st.expander("상품 미리보기"):
@@ -1199,7 +1214,7 @@ if run_btn:
             register_result_rows = []
 
             if run_create_groups:
-                st.subheader("1. 광고그룹 생성")
+                st.subheader(f"1. 광고그룹 생성 ({category_level} 기준)")
                 group_map, group_result_rows = create_missing_adgroups(
                     api_key=api_key,
                     secret_key=secret_key,
