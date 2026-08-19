@@ -12,7 +12,7 @@ from datetime import datetime
 import json
 import os
 BASE_URL = "https://api.searchad.naver.com"
-st.write("VERSION 2026-06-19-캠페인중복제외-배치등록")
+st.write("VERSION 2026-08-19-중분류선택")
 SETTING_FILE = "settings.json"
 MAX_ADS_PER_GROUP = 1000
 BATCH_SIZE = 20  # 한 번에 등록할 상품 수. 처음엔 20 권장, 안정적이면 50으로 증가 가능
